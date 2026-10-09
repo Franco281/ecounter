@@ -1,7 +1,9 @@
 from core.config import ConfiguracionEscena, calibrar_escena
 from core.counter import ContadorMovilidadPerimetral
 from core.events import imprimir_evento
+from core.enviador import EnviadorEventos
 from tkinter import Tk, filedialog
+import os
 
 
 def seleccionar_video() -> str:
@@ -37,11 +39,26 @@ if __name__ == "__main__":
             print("Calibracion cancelada.")
             raise SystemExit(0)
 
+    backend_url = os.environ.get("BACKEND_URL")
+    enviador = None
+    if backend_url:
+        enviador = EnviadorEventos(backend_url, token=os.environ.get("BACKEND_TOKEN"))
+
+    def al_contar(evento):
+        imprimir_evento(evento)
+        if enviador is not None:
+            enviador(evento)
+
     contador = ContadorMovilidadPerimetral(
         video_source=video_source,
-        api_callback=imprimir_evento,
-        model_path=None,
+        api_callback=al_contar,
+        dispositivo_id=os.environ.get("DISPOSITIVO_ID", "edge-01"),
+        model_path="yolo26s.pt",
         config=config,
-        confianza_min=0.45,
+        confianza_min=0.3,
     )
-    contador.procesar_video()
+    try:
+        contador.procesar_video()
+    finally:
+        if enviador is not None:
+            enviador.cerrar()

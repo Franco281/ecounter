@@ -1,6 +1,8 @@
 from typing import Tuple
 
-from pydantic import BaseModel
+import uuid
+
+from pydantic import BaseModel, Field
 
 
 class DeteccionObjeto(BaseModel):
@@ -11,6 +13,8 @@ class DeteccionObjeto(BaseModel):
 
 
 class EventoCiclovia(BaseModel):
+    evento_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    dispositivo_id: str = ""
     timestamp: str
     clase_objeto: str
     direccion: str

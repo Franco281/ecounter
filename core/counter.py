@@ -1,4 +1,5 @@
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Tuple
 
@@ -10,6 +11,20 @@ from .config import ConfiguracionEscena
 from .detector import DetectorONNX
 from .events import imprimir_evento
 from .models import DeteccionObjeto, EventoCiclovia
+
+ClasesContables = ("peaton", "bicicleta", "motociclista")
+
+
+def _pitar():
+    """Emite un pitido en un hilo aparte para no frenar el bucle de video."""
+    def _sonar():
+        try:
+            import winsound
+            winsound.Beep(1000, 150)
+        except ImportError:
+            print("\a", end="", flush=True)
+
+    threading.Thread(target=_sonar, daemon=True).start()
 
 
 class ContadorMovilidadPerimetral:
@@ -30,6 +45,7 @@ class ContadorMovilidadPerimetral:
         confianza_min: float = 0.40,
         config: ConfiguracionEscena | dict | None = None,
         config_path: str | None = None,
+        dispositivo_id: str = "",
     ):
         """Inicializa la cámara, la configuración del sitio y el detector; si no hay engine real, el sistema entra en modo de demostración para pruebas locales."""
         if video_source == "":
@@ -48,6 +64,7 @@ class ContadorMovilidadPerimetral:
 
         self.config = config
         self.api_callback = api_callback
+        self.dispositivo_id = dispositivo_id
         self.roi = self.config.roi
         self.linea_conteo = self.config.linea_conteo
         self.linea_conteo_y = self.linea_conteo[1]
@@ -66,13 +83,14 @@ class ContadorMovilidadPerimetral:
 
         self.historial_posiciones: Dict[int, Tuple[int, int]] = {}
         self.ids_contados: set[int] = set()
+        self.conteo_por_clase: Dict[str, int] = {}
         self._tracking_actual: Dict[int, Tuple[int, int]] = {}
         self.next_tracking_id = 1
 
     def detectar(self, frame: np.ndarray) -> List[DeteccionObjeto]:
         """Obtiene las detecciones del frame actual y las normaliza para que la lógica de conteo trabaje con una estructura uniforme, independientemente de si usa detector real o simulación."""
         if self.detector is not None:
-            objetos = self.detector.detectar(frame)
+            objetos = self.detector.detectar(frame, roi=self.roi)
             return self._normalizar_detecciones(objetos)
         return self._simular_rastreador_ia(frame)
 
@@ -108,32 +126,31 @@ class ContadorMovilidadPerimetral:
             )
         ]
 
-    def _cruza_linea(self, centroide: Tuple[int, int], y_anterior: int | None = None) -> bool:
-        """Decide si el centroide del objeto ha pasado la línea de conteo; esto es lo que dispara el evento de entrada o salida del flujo."""
-        x_actual, y_actual = centroide
+    def _cruza_linea(self, centroide: Tuple[int, int], anterior: Tuple[int, int]) -> bool:
+        """Decide si el objeto cruzó la línea de arriba hacia abajo (también cuando la línea está inclinada)."""
         x1, y1, x2, y2 = self.linea_conteo
+        if x1 > x2:
+            x1, y1, x2, y2 = x2, y2, x1, y1
 
-        if abs(y2 - y1) < 2:
-            if y_anterior is None:
-                return False
-            return y_anterior <= self.linea_conteo_y < y_actual
+        def lado(p: Tuple[int, int]) -> float:
+            return (x2 - x1) * (p[1] - y1) - (y2 - y1) * (p[0] - x1)
 
-        if abs(x2 - x1) < 2:
-            if y_anterior is None:
-                return False
-            return x_actual >= min(x1, x2) and x_actual <= max(x1, x2) and y_anterior <= y_actual
-
-        return False
+        dentro_del_tramo = x1 <= centroide[0] <= x2
+        return dentro_del_tramo and lado(anterior) <= 0 < lado(centroide)
 
     def procesar_video(self):
         """Recorre la secuencia de video, evalúa la posición de cada objeto y dispara un evento cada vez que cruza la línea de conteo."""
         fps_limiter = 0
-        frame_skip = 2
+        frame_skip = 1
+        fps = self.video.get(cv2.CAP_PROP_FPS) or 30
+        periodo = 1.0 / (fps * 0.8)
+        siguiente = time.perf_counter()
 
         while self.video.isOpened():
             ret, frame = self.video.read()
             if not ret:
                 break
+            siguiente += periodo
 
             fps_limiter += 1
             if fps_limiter % frame_skip != 0:
@@ -152,10 +169,14 @@ class ContadorMovilidadPerimetral:
                 x_anterior, y_anterior = self.historial_posiciones[id_obj]
                 self.historial_posiciones[id_obj] = (x_actual, y_actual)
 
-                if self._cruza_linea((x_actual, y_actual), y_anterior):
+                if self._cruza_linea((x_actual, y_actual), (x_anterior, y_anterior)):
                     if id_obj not in self.ids_contados:
                         self.ids_contados.add(id_obj)
+                        self.conteo_por_clase[obj.clase] = self.conteo_por_clase.get(obj.clase, 0) + 1
+                        if obj.clase == "bicicleta":
+                            _pitar()
                         evento = EventoCiclovia(
+                            dispositivo_id=self.dispositivo_id,
                             timestamp=datetime.now(timezone.utc).isoformat(),
                             clase_objeto=obj.clase,
                             direccion=self.config.direccion_aceptada,
@@ -166,7 +187,37 @@ class ContadorMovilidadPerimetral:
             if len(self.historial_posiciones) > 200:
                 self._limpiar_memoria_tracking()
 
+            x1r, y1r, x2r, y2r = self.roi
+            cv2.rectangle(frame, (x1r, y1r), (x2r, y2r), (0, 255, 0), 2)
+            lx1, ly1, lx2, ly2 = self.linea_conteo
+            cv2.line(frame, (lx1, ly1), (lx2, ly2), (0, 0, 255), 2)
+            for o in objetos_detectados:
+                if o.clase != "bicicleta":
+                    continue
+                color = (255, 0, 0) if o.id_tracking in self.ids_contados else (0, 255, 0)
+                cv2.drawContours(frame, [self._triangulo(o.centroide)], 0, color, 2)
+                cv2.putText(frame, f"{o.id_tracking} {o.confianza:.0%}", o.centroide, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            lineas = [f"Total: {sum(self.conteo_por_clase.values())}"]
+            for clase in ClasesContables:
+                lineas.append(f"{clase}: {self.conteo_por_clase.get(clase, 0)}")
+            lineas.append("q: salir")
+            cv2.rectangle(frame, (0, 0), (260, 12 + len(lineas) * 30), (0, 0, 0), -1)
+            for i, txt in enumerate(lineas):
+                cv2.putText(frame, txt, (10, 30 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.namedWindow("Conteo", cv2.WINDOW_NORMAL)
+            cv2.imshow("Conteo", frame)
+            espera = max(1, int((siguiente - time.perf_counter()) * 1000))
+            if cv2.waitKey(espera) & 0xFF == ord("q"):
+                break
+
         self.video.release()
+        cv2.destroyAllWindows()
+        print(f"Procesamiento finalizado. Total contados: {sum(self.conteo_por_clase.values())} {self.conteo_por_clase}")
+
+    def _triangulo(self, centroide: Tuple[int, int], r: int = 20) -> np.ndarray:
+        x, y = centroide
+        return np.array([[x, y - r], [x - r, y + r], [x + r, y + r]], dtype=np.int32)
 
     def _limpiar_memoria_tracking(self):
         """Evita que el historial de objetos crezca indefinidamente y consuma memoria en una ejecución continua del sistema."""
